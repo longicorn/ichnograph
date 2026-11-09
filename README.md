@@ -1,5 +1,7 @@
 # ichnograph
 
+[日本語](README.ja.md)
+
 Ichnograph helps investigate what a product feature depends on and what might affect it in its execution environment. It aims to connect runtime observations with information about code, libraries, packages, and services in a dependency graph, supporting investigations such as the impact of component updates.
 
 The name combines **ichno** and **graph**. The root *ichno* appears in words such as ichnofossil, ichnite, and ichnology. The name reflects the goal of bringing together different kinds of information and their relationships.
@@ -61,3 +63,83 @@ If entry events overlap on a thread or an exit does not match its pending entry,
 `TestWriteEvents` checks successful write, pwrite64, writev, pwritev and pwritev2 operations and a failed write. Other write methods, including memory-mapped writes, are not covered.
 
 `TestProcSelfHash` checks that successful opens of `/proc/self/status` and a symlink to it are recorded without misleading post-run hashes.
+
+## Running in Docker
+
+Running `ichnograph` inside a container requires sharing the host PID namespace (`--pid=host` or `pid: "host"`), privileges to load eBPF programs and attach tracepoints, an unlimited or sufficiently high locked-memory limit (`RLIMIT_MEMLOCK`), and access to `tracefs` or `debugfs` (`/sys/kernel/tracing` or `/sys/kernel/debug`).
+
+- If the container uses an isolated PID namespace instead of the host PID namespace, container PIDs do not match the host PIDs observed by eBPF, producing `"records": []` and `"descendants_remaining": true`.
+- If container privileges or `RLIMIT_MEMLOCK` are insufficient, startup fails with `load eBPF programs (requires BPF privileges): map ...: map create: operation not permitted (MEMLOCK may be too low, consider rlimit.RemoveMemlock)`.
+- If neither `tracefs` nor `debugfs` is mounted inside the container, tracepoint attachment fails with `attach sched_process_fork: neither debugfs nor tracefs are mounted` even when `privileged` is enabled.
+
+With `docker run` using `--privileged`:
+
+```sh
+docker run --rm -it \
+  --pid=host \
+  --privileged \
+  --ulimit memlock=-1:-1 \
+  -v /sys/kernel/tracing:/sys/kernel/tracing:rw \
+  -v /sys/kernel/debug:/sys/kernel/debug:rw \
+  <image> ./ichnograph -o result.json /path/to/command arg
+```
+
+With `docker run` using explicit capabilities instead of `--privileged`:
+
+```sh
+docker run --rm -it \
+  --pid=host \
+  --cap-add=BPF \
+  --cap-add=PERFMON \
+  --cap-add=SYS_ADMIN \
+  --cap-add=IPC_LOCK \
+  --security-opt seccomp=unconfined \
+  --ulimit memlock=-1:-1 \
+  -v /sys/kernel/tracing:/sys/kernel/tracing:rw \
+  -v /sys/kernel/debug:/sys/kernel/debug:rw \
+  <image> ./ichnograph -o result.json /path/to/command arg
+```
+
+With Docker Compose (`compose.yaml`):
+
+```yaml
+services:
+  app:
+    pid: "host"
+    privileged: true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - /sys/kernel/tracing:/sys/kernel/tracing:rw
+      - /sys/kernel/debug:/sys/kernel/debug:rw
+```
+
+Or with explicit capabilities in `compose.yaml`:
+
+```yaml
+services:
+  app:
+    pid: "host"
+    cap_add:
+      - BPF
+      - PERFMON
+      - SYS_ADMIN
+      - IPC_LOCK
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - /sys/kernel/tracing:/sys/kernel/tracing:rw
+      - /sys/kernel/debug:/sys/kernel/debug:rw
+```
+
+If `/sys/kernel/tracing` is not mounted on the host (for example, in some VM-backed container environments), mount `tracefs` inside a privileged container before running `ichnograph`:
+
+```sh
+mount -t tracefs nodev /sys/kernel/tracing
+```

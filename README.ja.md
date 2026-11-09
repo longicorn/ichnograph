@@ -1,5 +1,7 @@
 # ichnograph
 
+[English](README.md)
+
 Ichnographは、プロダクトの機能が何に依存し、何から影響を受けるかを実行環境に即して調べるためのツールです。実行時の観測結果とコード、ライブラリ、パッケージ、サービスなどの情報を依存関係のグラフで結び付け、コンポーネントの更新時などの影響調査に役立てることを目指します。
 
 名前は**ichno**と**graph**を組み合わせたものです。ichnoは、生痕化石を表すichnofossilやichnite、生痕化石学を表すichnologyに含まれる語源です。さまざまな情報とその関係をまとめるという目標を名前に込めています。
@@ -61,3 +63,83 @@ sudo env "PATH=$PATH" ICHNOGRAPH_BPF_TEST=1 go test ./internal/ebpf -run '^TestN
 `TestWriteEvents`は書き込み操作の成功とwriteの失敗を確認します。
 
 `TestProcSelfHash`は、`/proc/self/status`と、そのシンボリックリンクのオープンに成功した記録に、収集後の誤解を招くハッシュが付かないことを確認します。
+
+## Dockerでの実行
+
+コンテナ内で`ichnograph`を実行するには、`--pid=host`または`pid: "host"`によるホストのPID名前空間の共有、eBPFプログラムのロードとトレースポイントへの接続に必要な権限、十分なロック可能メモリ上限である`RLIMIT_MEMLOCK`、および`/sys/kernel/tracing`の`tracefs`または`/sys/kernel/debug`の`debugfs`へのアクセスが必要です。
+
+- ホストのPID名前空間を共有せずに分離されたPID名前空間で実行すると、コンテナ内のPIDとeBPFが観測するホスト側のPIDが一致せず、`"records": []`かつ`"descendants_remaining": true`になります。
+- コンテナの権限または`RLIMIT_MEMLOCK`が不足していると、起動時に`load eBPF programs (requires BPF privileges): map ...: map create: operation not permitted (MEMLOCK may be too low, consider rlimit.RemoveMemlock)`というエラーで失敗します。
+- コンテナ内に`tracefs`も`debugfs`もマウントされていない場合は、`privileged`を有効にしていてもトレースポイントへの接続時に`attach sched_process_fork: neither debugfs nor tracefs are mounted`というエラーで失敗します。
+
+`docker run`で`--privileged`を使う場合は、次のように実行します。
+
+```sh
+docker run --rm -it \
+  --pid=host \
+  --privileged \
+  --ulimit memlock=-1:-1 \
+  -v /sys/kernel/tracing:/sys/kernel/tracing:rw \
+  -v /sys/kernel/debug:/sys/kernel/debug:rw \
+  <image> ./ichnograph -o result.json /path/to/command arg
+```
+
+`--privileged`を使わずに必要なケーパビリティを個別に指定する場合は、次のように実行します。
+
+```sh
+docker run --rm -it \
+  --pid=host \
+  --cap-add=BPF \
+  --cap-add=PERFMON \
+  --cap-add=SYS_ADMIN \
+  --cap-add=IPC_LOCK \
+  --security-opt seccomp=unconfined \
+  --ulimit memlock=-1:-1 \
+  -v /sys/kernel/tracing:/sys/kernel/tracing:rw \
+  -v /sys/kernel/debug:/sys/kernel/debug:rw \
+  <image> ./ichnograph -o result.json /path/to/command arg
+```
+
+Docker Composeの`compose.yaml`で`privileged`を使う場合は、次のように設定します。
+
+```yaml
+services:
+  app:
+    pid: "host"
+    privileged: true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - /sys/kernel/tracing:/sys/kernel/tracing:rw
+      - /sys/kernel/debug:/sys/kernel/debug:rw
+```
+
+`compose.yaml`でケーパビリティを個別に指定する場合は、次のように設定します。
+
+```yaml
+services:
+  app:
+    pid: "host"
+    cap_add:
+      - BPF
+      - PERFMON
+      - SYS_ADMIN
+      - IPC_LOCK
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - /sys/kernel/tracing:/sys/kernel/tracing:rw
+      - /sys/kernel/debug:/sys/kernel/debug:rw
+```
+
+仮想マシン上で動作するコンテナ環境などでホスト側に`/sys/kernel/tracing`がマウントされていない場合は、特権コンテナ内で`ichnograph`を実行する前に`tracefs`をマウントします。
+
+```sh
+mount -t tracefs nodev /sys/kernel/tracing
+```
