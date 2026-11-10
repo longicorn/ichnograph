@@ -2,6 +2,7 @@ package ebpf
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"golang.org/x/sys/unix"
 	"os"
@@ -446,5 +447,153 @@ func TestExecSchedulerSuccessInvalidatedByLoss(t *testing.T) {
 	result.invalidateOnLoss()
 	if result.Records[0].Success != nil || len(result.Limitations) == 0 {
 		t.Fatalf("scheduler result survived loss: %+v", result)
+	}
+}
+
+func TestLossMapHasBreakdownSlots(t *testing.T) {
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(object))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.Maps["lost"].MaxEntries; got != 7 {
+		t.Fatalf("lost map entries = %d, want 7", got)
+	}
+}
+
+func TestDecodeEventSizes(t *testing.T) {
+	for _, size := range []int{64, 288} {
+		data := make([]byte, size)
+		binary.LittleEndian.PutUint32(data[24:], 13)
+		var event rawEvent
+		if err := decodeEvent(data, &event); err != nil || event.Kind != 13 {
+			t.Fatalf("size %d: kind %d, error %v", size, event.Kind, err)
+		}
+	}
+	if err := decodeEvent(make([]byte, 31), &rawEvent{}); err == nil {
+		t.Fatal("accepted malformed event")
+	}
+}
+
+func TestWriteObservationDoesNotCorrelateWithOtherEvents(t *testing.T) {
+	state := eventState{pending: make(map[uint32]int)}
+	state.add(rawEvent{PID: 1, TID: 1, Kind: 18, DirFD: 3})
+	state.add(rawEvent{PID: 1, TID: 1, Kind: 11})
+	state.add(rawEvent{TID: 1, Kind: 11, DirFD: 3})
+	if len(state.records) != 2 || state.records[0].Event != "write_observed" || state.records[0].Success == nil || !*state.records[0].Success || state.records[1].Success == nil || !*state.records[1].Success || state.ambiguous {
+		t.Fatalf("unexpected records: %+v", state.records)
+	}
+}
+
+func TestReadDedupRequiresResolvedSuccessfulRead(t *testing.T) {
+	success := true
+	count := int32(1)
+	rec := Record{rawKind: 1, Success: &success, BytesRead: &count, readIdentity: readIdentity{ProcessStart: 1}}
+	if eligibleForReadDedup(&rec, 1) {
+		t.Fatal("unresolved read was eligible")
+	}
+	rec.ResolvedPath = "/file"
+	if !eligibleForReadDedup(&rec, 1) {
+		t.Fatal("resolved successful read was not eligible")
+	}
+	count = 0
+	if eligibleForReadDedup(&rec, 1) {
+		t.Fatal("zero-byte read was eligible")
+	}
+}
+
+func TestMatchesReadIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		t.Fatal(err)
+	}
+	id := readIdentity{Ino: st.Ino, ProcessStart: 1, Dev: unix.Major(uint64(st.Dev))<<20 | unix.Minor(uint64(st.Dev))}
+	if !matchesReadIdentity(path, id) {
+		t.Fatal("matching identity rejected")
+	}
+	id.Ino++
+	if matchesReadIdentity(path, id) {
+		t.Fatal("different inode accepted")
+	}
+}
+
+func TestDecodeConnect(t *testing.T) {
+	raw := rawEvent{PID: 2, TID: 2, Kind: 19, DirFD: 4, PathResult: 16}
+	binary.LittleEndian.PutUint16(raw.Path[:2], unix.AF_INET)
+	binary.BigEndian.PutUint16(raw.Path[2:4], 8080)
+	binary.LittleEndian.PutUint16(raw.Path[128:130], unix.SOCK_STREAM)
+	copy(raw.Path[4:8], []byte{127, 0, 0, 1})
+	state := eventState{pending: make(map[uint32]int)}
+	state.add(raw)
+	if len(state.records) != 1 || state.records[0].Network == nil || state.records[0].Network.Address != "127.0.0.1" || state.records[0].Network.SocketType != "stream" || state.records[0].Network.Port == nil || *state.records[0].Network.Port != 8080 || state.records[0].Success != nil || len(state.pending) != 1 {
+		t.Fatalf("unexpected connection: %+v", state.records)
+	}
+	raw.PathResult = 3
+	network, note := decodeConnect(raw)
+	if network != nil || note == "" {
+		t.Fatalf("short address: %+v %q", network, note)
+	}
+}
+
+func TestConnectResults(t *testing.T) {
+	for _, tc := range []struct {
+		ret  int32
+		want *bool
+		err  bool
+	}{{0, boolPtr(true), false}, {-int32(unix.ECONNREFUSED), boolPtr(false), true}, {-int32(unix.EINPROGRESS), nil, false}} {
+		state := eventState{pending: make(map[uint32]int)}
+		state.add(rawEvent{PID: 1, TID: 1, Kind: 19, PathResult: 16})
+		state.add(rawEvent{TID: 1, Kind: 19, DirFD: tc.ret})
+		got := state.records[0]
+		if (got.Success == nil) != (tc.want == nil) || (got.Success != nil && *got.Success != *tc.want) || (got.ConnectError != "") != tc.err {
+			t.Fatalf("return %d: %+v", tc.ret, got)
+		}
+	}
+}
+func boolPtr(v bool) *bool { return &v }
+
+func TestPipeUseDoesNotEnterCorrelation(t *testing.T) {
+	state := eventState{pending: make(map[uint32]int)}
+	state.add(rawEvent{PID: 1, TID: 2, Kind: 20, DirFD: 4, PathResult: 2})
+	state.add(rawEvent{PID: 1, TID: 2, Kind: 21, DirFD: 5, PathResult: 1})
+	if len(state.records) != 2 || state.records[0].Event != "fifo_use_attempt" || !strings.HasPrefix(state.records[0].Note, "write attempted") || state.records[1].Event != "pipe_use_attempt" || len(state.pending) != 0 {
+		t.Fatalf("unexpected records: %+v", state.records)
+	}
+}
+
+func TestAggregateConnections(t *testing.T) {
+	fd := int32(4)
+	port := uint16(53)
+	yes, no := true, false
+	net4 := func() *NetworkObservation {
+		return &NetworkObservation{Family: "ipv4", SocketType: "datagram", Address: "127.0.0.1", Port: &port}
+	}
+	base := Record{Event: "connect_attempt", PID: 1, TID: 2, FD: &fd, Network: net4(), Success: &yes}
+	second := base
+	failure := base
+	failure.Success = &no
+	failure.ConnectError = "refused"
+	other := base
+	other.TID = 3
+	unixRec := Record{Event: "connect_attempt", PID: 1, TID: 2, FD: &fd, Network: &NetworkObservation{Family: "unix"}}
+	r := Result{Records: []Record{base, second, failure, other, unixRec, unixRec}}
+	r.aggregateConnections()
+	if len(r.Records) != 5 || r.Records[0].Occurrences != 2 || r.Records[1].Success == nil || *r.Records[1].Success || r.Records[3].Occurrences != 0 || r.Records[4].Occurrences != 0 {
+		t.Fatalf("unexpected aggregation: %+v", r.Records)
+	}
+}
+
+func TestTCPStateDoesNotAffectPendingConnect(t *testing.T) {
+	state := eventState{pending: make(map[uint32]int)}
+	entry := rawEvent{PID: 7, TID: 8, Kind: 19, PathResult: 16}
+	binary.LittleEndian.PutUint64(entry.Path[136:144], 123)
+	state.add(entry)
+	state.add(rawEvent{PID: 7, TID: 8, Kind: 22, DirFD: 1, Identity: readIdentity{ProcessStart: 123}})
+	state.add(rawEvent{TID: 8, Kind: 19, DirFD: -int32(unix.EINPROGRESS)})
+	if len(state.records) != 2 || state.records[0].ConnectionID != 123 || state.records[0].Success != nil || state.records[1].ConnectionID != 123 || state.records[1].TCPOutcome != "established" || state.ambiguous {
+		t.Fatalf("unexpected state: %+v", state)
 	}
 }

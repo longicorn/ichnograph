@@ -8,10 +8,12 @@ import (
 	bpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -223,21 +225,14 @@ func TestWriteEvents(t *testing.T) {
 	if result.Lost != 0 {
 		t.Fatalf("lost %d events", result.Lost)
 	}
-	found := make(map[string]bool)
-	failed := false
+	count := 0
 	for _, rec := range result.Records {
-		if rec.Event != "write_attempt" && rec.Event != "pwrite_attempt" && rec.Event != "writev_attempt" && rec.Event != "pwritev_attempt" && rec.Event != "pwritev2_attempt" {
-			continue
-		}
-		if rec.FD != nil && *rec.FD == -1 && rec.Event == "write_attempt" {
-			failed = rec.Success != nil && !*rec.Success && rec.WriteError == unix.EBADF.Error() && rec.BytesWritten == nil
-		}
-		if rec.ResolvedPath == path && rec.Success != nil && *rec.Success && rec.BytesWritten != nil && *rec.BytesWritten == 5 && rec.BytesRead == nil {
-			found[rec.Event] = true
+		if rec.Event == "write_observed" && rec.ResolvedPath == path && rec.Success != nil && *rec.Success && rec.BytesWritten == nil {
+			count++
 		}
 	}
-	if !found["write_attempt"] || !found["pwrite_attempt"] || !found["writev_attempt"] || !found["pwritev_attempt"] || !found["pwritev2_attempt"] || !failed {
-		t.Fatalf("missing write results: found=%v failed=%v records=%s", found, failed, data)
+	if count != 1 {
+		t.Fatalf("expected one retained regular-file write observation: count=%d records=%s", count, data)
 	}
 }
 
@@ -401,7 +396,11 @@ func TestInheritedRead(t *testing.T) {
 		t.Fatalf("collection lost %d events", result.Lost)
 	}
 	found := make(map[string]bool)
+	readCount := 0
 	for _, record := range result.Records {
+		if record.FD != nil && *record.FD == 0 && record.ResolvedPath == input && (record.Event == "read_attempt" || record.Event == "pread_attempt" || record.Event == "readv_attempt" || record.Event == "preadv_attempt" || record.Event == "preadv2_attempt") {
+			readCount++
+		}
 		if record.Event == "mmap_attempt" && record.FD != nil && *record.FD == 0 && record.ResolvedPath == input && record.Success != nil && *record.Success && record.Note != "" {
 			found[record.Event] = true
 		}
@@ -409,7 +408,10 @@ func TestInheritedRead(t *testing.T) {
 			found[record.Event] = true
 		}
 	}
-	for _, event := range []string{"read_attempt", "pread_attempt", "readv_attempt", "preadv_attempt", "preadv2_attempt", "mmap_attempt"} {
+	if readCount < 1 {
+		t.Fatalf("expected a regular-file read, got %d: %s", readCount, data)
+	}
+	for _, event := range []string{"read_attempt", "mmap_attempt"} {
 		if !found[event] {
 			t.Fatalf("missing %s record: %s", event, data)
 		}
@@ -1060,4 +1062,806 @@ func TestCollectorLoss(t *testing.T) {
 		t.Fatalf("missing loss limitation: %s", data)
 	}
 	t.Logf("collector reported %d lost events and %d retained records", decoded.Lost, len(decoded.Records))
+}
+
+// TestStandardPipeSuppression exercises kernel-side filtering; inherited regular files
+// remain covered by TestInheritedRead.
+func TestStandardPipeSuppression(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	dir := t.TempDir()
+	collector := filepath.Join(dir, "ichnograph")
+	if out, err := exec.Command("go", "build", "-o", collector, "../../cmd/ichnograph").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v: %s", err, out)
+	}
+	output := filepath.Join(dir, "result.json")
+	cmd := exec.Command(collector, "-o", output, "/bin/sh", "-c", "printf pipe-test")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("collect: %v: %s", err, out)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result Result
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Lost != 0 {
+		t.Fatalf("lost %d events", result.Lost)
+	}
+	for _, rec := range result.Records {
+		if rec.Event == "write_observed" && rec.FD != nil && *rec.FD == 1 {
+			t.Fatalf("standard pipe write recorded: %+v", rec)
+		}
+	}
+}
+
+// TestReadCoverage reports known read-evidence gaps as subtest failures.
+func TestReadCoverage(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	dir := t.TempDir()
+	collector, target := filepath.Join(dir, "ichnograph"), filepath.Join(dir, "readcoverage")
+	for _, item := range []struct{ output, pkg string }{{collector, "../../cmd/ichnograph"}, {target, "./testdata/readcoverage"}} {
+		if out, err := exec.Command("go", "build", "-o", item.output, item.pkg).CombinedOutput(); err != nil {
+			t.Fatalf("build %s: %v\n%s", item.pkg, err, out)
+		}
+	}
+	names := []string{"reuse-a", "reuse-b", "retry", "thread-a", "thread-b", "short"}
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("hello"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	output := filepath.Join(dir, "result.json")
+	if out, err := exec.Command(collector, "-o", output, target, dir).CombinedOutput(); err != nil {
+		t.Fatalf("collect: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result Result
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("lost=%d breakdown=%+v records=%d", result.Lost, result.LossBreakdown, len(result.Records))
+	if result.Lost != 0 {
+		t.Errorf("lost %d events", result.Lost)
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(dir, name)
+			var opened, read bool
+			for _, record := range result.Records {
+				if record.Event == "open_attempt" && record.Path == path && record.Success != nil && *record.Success {
+					opened = true
+				}
+				if (record.Event == "read_attempt" || record.Event == "pread_attempt" || record.Event == "readv_attempt" || record.Event == "preadv_attempt" || record.Event == "preadv2_attempt") && record.ResolvedPath == path && record.Success != nil && *record.Success && record.BytesRead != nil && *record.BytesRead > 0 {
+					read = true
+				}
+			}
+			t.Logf("successful open=%v, successful read with resolved path=%v", opened, read)
+			if !opened || !read {
+				t.Errorf("missing expected evidence for %s", name)
+			}
+		})
+	}
+}
+
+func TestWriteDedupAndFDReuse(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	dir := t.TempDir()
+	collector, target := filepath.Join(dir, "ichnograph"), filepath.Join(dir, "writecoverage")
+	for _, item := range []struct{ output, pkg string }{{collector, "../../cmd/ichnograph"}, {target, "./testdata/writecoverage"}} {
+		if out, err := exec.Command("go", "build", "-o", item.output, item.pkg).CombinedOutput(); err != nil {
+			t.Fatalf("build: %v: %s", err, out)
+		}
+	}
+	for _, name := range []string{"first", "second"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	output := filepath.Join(dir, "result.json")
+	if out, err := exec.Command(collector, "-o", output, target, dir).CombinedOutput(); err != nil {
+		t.Fatalf("collect: %v: %s", err, out)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result Result
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Lost != 0 {
+		t.Errorf("lost %d events", result.Lost)
+	}
+	for _, name := range []string{"first", "second"} {
+		path := filepath.Join(dir, name)
+		count := 0
+		for _, rec := range result.Records {
+			if rec.Event == "write_observed" && rec.ResolvedPath == path && rec.Success != nil && *rec.Success {
+				count++
+			}
+		}
+		t.Logf("%s: %d successful write observations", name, count)
+		if count < 1 || count > 20 {
+			t.Errorf("expected 1 to 20 observations for 1000 writes to %s, got %d", name, count)
+		}
+	}
+}
+
+func TestTerminalIOSuppression(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	dir := t.TempDir()
+	collector := filepath.Join(dir, "ichnograph")
+	if out, err := exec.Command("go", "build", "-o", collector, "../../cmd/ichnograph").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v: %s", err, out)
+	}
+	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	if err := unix.IoctlSetPointerInt(int(master.Fd()), unix.TIOCSPTLCK, 0); err != nil {
+		t.Fatal(err)
+	}
+	number, err := unix.IoctlGetInt(int(master.Fd()), unix.TIOCGPTN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", number), os.O_RDWR|unix.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slave.Close()
+	for _, tc := range []struct {
+		name   string
+		stdout *os.File
+		want   bool
+	}{{"terminal", slave, false}, {"null", nil, false}, {"zero", nil, false}, {"urandom", nil, false}, {"regular", nil, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			outFile := tc.stdout
+			if outFile == nil {
+				var err error
+				path := "/dev/" + tc.name
+				flags := os.O_WRONLY
+				if tc.name == "regular" {
+					path = filepath.Join(dir, "regular-output")
+					flags |= os.O_CREATE
+				}
+				outFile, err = os.OpenFile(path, flags, 0600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer outFile.Close()
+			}
+			resultPath := filepath.Join(dir, tc.name+".json")
+			cmd := exec.Command(collector, "-o", resultPath, "/bin/sh", "-c", "printf terminal-test; sleep 0.1")
+			cmd.Stdout = outFile
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("collect: %v: %s", err, stderr.String())
+			}
+			data, err := os.ReadFile(resultPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result Result
+			if err := json.Unmarshal(data, &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Lost != 0 {
+				t.Fatalf("lost %d events", result.Lost)
+			}
+			found := false
+			for _, rec := range result.Records {
+				if rec.Event == "write_observed" && rec.FD != nil && *rec.FD == 1 {
+					found = true
+				}
+			}
+			if found != tc.want {
+				t.Fatalf("write observation = %v, want %v", found, tc.want)
+			}
+		})
+	}
+}
+
+func TestSpecialDeviceReadSuppression(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	dir := t.TempDir()
+	collector, target := filepath.Join(dir, "ichnograph"), filepath.Join(dir, "readone")
+	for _, item := range []struct{ output, pkg string }{{collector, "../../cmd/ichnograph"}, {target, "./testdata/readone"}} {
+		if out, err := exec.Command("go", "build", "-o", item.output, item.pkg).CombinedOutput(); err != nil {
+			t.Fatalf("build: %v: %s", err, out)
+		}
+	}
+	regular := filepath.Join(dir, "input")
+	if err := os.WriteFile(regular, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, path string
+		want       bool
+	}{{"null", "/dev/null", false}, {"zero", "/dev/zero", false}, {"full", "/dev/full", false}, {"random", "/dev/random", false}, {"urandom", "/dev/urandom", false}, {"regular", regular, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			in, err := os.Open(tc.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer in.Close()
+			output := filepath.Join(dir, tc.name+".json")
+			cmd := exec.Command(collector, "-o", output, target)
+			cmd.Stdin = in
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("collect: %v: %s", err, out)
+			}
+			data, err := os.ReadFile(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result Result
+			if err := json.Unmarshal(data, &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Lost != 0 {
+				t.Fatalf("lost %d events", result.Lost)
+			}
+			found := false
+			for _, rec := range result.Records {
+				if rec.Event == "read_attempt" && rec.FD != nil && *rec.FD == 0 {
+					found = true
+				}
+			}
+			if found != tc.want {
+				t.Fatalf("stdin read observed=%v, want %v", found, tc.want)
+			}
+		})
+	}
+}
+
+func TestConnectObservation(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	dir := t.TempDir()
+	collector, target := filepath.Join(dir, "ichnograph"), filepath.Join(dir, "connect")
+	for _, item := range []struct{ output, pkg string }{{collector, "../../cmd/ichnograph"}, {target, "./testdata/connect"}} {
+		if out, err := exec.Command("go", "build", "-o", item.output, item.pkg).CombinedOutput(); err != nil {
+			t.Fatalf("build: %v: %s", err, out)
+		}
+	}
+	output := filepath.Join(dir, "result.json")
+	if out, err := exec.Command(collector, "-o", output, target, strconv.Itoa(port)).CombinedOutput(); err != nil {
+		t.Fatalf("collect: %v: %s", err, out)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result Result
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Lost != 0 {
+		t.Fatalf("lost %d events", result.Lost)
+	}
+	for _, rec := range result.Records {
+		if rec.Event == "connect_attempt" && rec.Network != nil && rec.Network.Family == "ipv4" && rec.Network.SocketType == "stream" && rec.Network.Address == "127.0.0.1" && rec.Network.Port != nil && int(*rec.Network.Port) == port && rec.Success != nil && *rec.Success {
+			return
+		}
+	}
+	t.Fatalf("missing connection attempt: %s", data)
+}
+
+func TestLogOutputFilter(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	dir := t.TempDir()
+	collector := filepath.Join(dir, "ichnograph")
+	if out, err := exec.Command("go", "build", "-o", collector, "../../cmd/ichnograph").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v: %s", err, out)
+	}
+	path := filepath.Join(dir, "input.log")
+	if err := os.WriteFile(path, []byte("hello"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, include := range []bool{false, true} {
+		name := "default"
+		if include {
+			name = "included"
+		}
+		t.Run(name, func(t *testing.T) {
+			output := filepath.Join(dir, name+".json")
+			args := []string{"-o", output}
+			if include {
+				args = append(args, "-include-logs")
+			}
+			args = append(args, "/bin/cat", path)
+			if out, err := exec.Command(collector, args...).CombinedOutput(); err != nil {
+				t.Fatalf("collect: %v: %s", err, out)
+			}
+			data, err := os.ReadFile(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result Result
+			if err := json.Unmarshal(data, &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Lost != 0 {
+				t.Fatalf("lost %d events", result.Lost)
+			}
+			found := false
+			for _, rec := range result.Records {
+				if rec.Path == path || rec.ResolvedPath == path {
+					found = true
+				}
+			}
+			if found != include {
+				t.Fatalf("log record found=%v, want %v", found, include)
+			}
+		})
+	}
+}
+
+func TestConnectKinds(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	dir := t.TempDir()
+	collector, target := filepath.Join(dir, "ichnograph"), filepath.Join(dir, "connect")
+	for _, item := range []struct{ output, pkg string }{{collector, "../../cmd/ichnograph"}, {target, "./testdata/connect"}} {
+		if out, err := exec.Command("go", "build", "-o", item.output, item.pkg).CombinedOutput(); err != nil {
+			t.Fatalf("build: %v: %s", err, out)
+		}
+	}
+	unixPath := filepath.Join(dir, "socket")
+	listener, err := net.Listen("unix", unixPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	udp, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	tcp, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcp.Close()
+	for _, tc := range []struct {
+		mode, arg, family, kind string
+		success                 int
+	}{{"unix", unixPath, "unix", "stream", 1}, {"fail", filepath.Join(dir, "missing"), "unix", "stream", -1}, {"udp", strconv.Itoa(udp.LocalAddr().(*net.UDPAddr).Port), "ipv4", "datagram", 1}, {"nonblock", strconv.Itoa(tcp.Addr().(*net.TCPAddr).Port), "ipv4", "stream", 0}} {
+		t.Run(tc.mode, func(t *testing.T) {
+			output := filepath.Join(dir, tc.mode+".json")
+			if out, err := exec.Command(collector, "-o", output, target, tc.mode, tc.arg).CombinedOutput(); err != nil {
+				t.Fatalf("collect: %v: %s", err, out)
+			}
+			data, err := os.ReadFile(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result Result
+			if err := json.Unmarshal(data, &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Lost != 0 {
+				t.Fatalf("lost %d events", result.Lost)
+			}
+			for _, rec := range result.Records {
+				if rec.Event != "connect_attempt" || rec.Network == nil || rec.Network.Family != tc.family || rec.Network.SocketType != tc.kind {
+					continue
+				}
+				if tc.success == 1 && rec.Success != nil && *rec.Success {
+					return
+				}
+				if tc.success == -1 && rec.Success != nil && !*rec.Success && rec.ConnectError != "" {
+					return
+				}
+				if tc.success == 0 && ((rec.Success == nil && strings.Contains(rec.Note, "pending")) || (rec.Success != nil && *rec.Success)) {
+					return
+				}
+			}
+			t.Fatalf("missing expected connection: %s", data)
+		})
+	}
+}
+
+func TestPipeKinds(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	dir := t.TempDir()
+	collector, target := filepath.Join(dir, "ichnograph"), filepath.Join(dir, "pipecoverage")
+	for _, item := range []struct{ output, pkg string }{{collector, "../../cmd/ichnograph"}, {target, "./testdata/pipecoverage"}} {
+		if out, err := exec.Command("go", "build", "-o", item.output, item.pkg).CombinedOutput(); err != nil {
+			t.Fatalf("build: %v: %s", err, out)
+		}
+	}
+	fifo := filepath.Join(dir, "fifo")
+	if err := unix.Mkfifo(fifo, 0600); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(dir, "result.json")
+	if out, err := exec.Command(collector, "-o", output, target, fifo).CombinedOutput(); err != nil {
+		t.Fatalf("collect: %v: %s", err, out)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result Result
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Lost != 0 {
+		t.Fatalf("lost %d events", result.Lost)
+	}
+	for _, kind := range []string{"pipe_use_attempt", "fifo_use_attempt"} {
+		for _, direction := range []string{"read", "write"} {
+			count := 0
+			for _, rec := range result.Records {
+				if rec.Event == kind && strings.HasPrefix(rec.Note, direction+" attempted") {
+					count++
+				}
+			}
+			t.Logf("%s %s: %d observations", kind, direction, count)
+			if count != 1 {
+				t.Errorf("expected one %s %s observation, got %d", kind, direction, count)
+			}
+		}
+	}
+}
+
+// TestNonblockingConnectOutcome captures the target's poll/SO_ERROR ground truth.
+// TCP state observations are checked against the target's final result.
+func TestNonblockingConnectOutcome(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	dir := t.TempDir()
+	collector, target := filepath.Join(dir, "ichnograph"), filepath.Join(dir, "connect")
+	for _, item := range []struct{ output, pkg string }{{collector, "../../cmd/ichnograph"}, {target, "./testdata/connect"}} {
+		if out, err := exec.Command("go", "build", "-o", item.output, item.pkg).CombinedOutput(); err != nil {
+			t.Fatalf("build: %v: %s", err, out)
+		}
+	}
+	server, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	// A bound, non-listening TCP socket provides a deterministic refused local port.
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	if err := unix.Bind(fd, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	addr, err := unix.Getsockname(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refusedPort := addr.(*unix.SockaddrInet4).Port
+	for _, tc := range []struct {
+		mode string
+		port int
+	}{{"poll-good", server.Addr().(*net.TCPAddr).Port}, {"poll-bad", refusedPort}} {
+		t.Run(tc.mode, func(t *testing.T) {
+			output := filepath.Join(dir, tc.mode+".json")
+			out, err := exec.Command(collector, "-o", output, target, tc.mode, strconv.Itoa(tc.port)).CombinedOutput()
+			if err != nil {
+				t.Fatalf("fixture: %v: %s", err, out)
+			}
+			t.Logf("target outcome: %s", strings.TrimSpace(string(out)))
+			data, err := os.ReadFile(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result Result
+			if err := json.Unmarshal(data, &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Lost != 0 {
+				t.Fatalf("lost %d events", result.Lost)
+			}
+			var connection *Record
+			for i := range result.Records {
+				rec := &result.Records[i]
+				if rec.Event == "connect_attempt" && rec.Network != nil && rec.Network.Port != nil && int(*rec.Network.Port) == tc.port {
+					connection = rec
+					break
+				}
+			}
+			if connection == nil {
+				t.Fatalf("missing connection observation: %s", data)
+			}
+			status := "unknown"
+			if connection.Success != nil {
+				status = strconv.FormatBool(*connection.Success)
+			}
+			t.Logf("collector: immediate success=%s id=%d", status, connection.ConnectionID)
+			if strings.Contains(string(out), "immediate=pending") && connection.Success != nil {
+				t.Fatalf("pending connect reported as immediate success: %+v", connection)
+			}
+			if connection.ConnectionID == 0 {
+				t.Fatalf("missing TCP correlation ID: %+v", connection)
+			}
+			want := "established"
+			if tc.mode == "poll-bad" {
+				want = "closed_before_established"
+			}
+			for _, rec := range result.Records {
+				if rec.Event == "tcp_connect_outcome" && rec.ConnectionID == connection.ConnectionID && rec.PID == connection.PID && rec.TID == connection.TID && rec.TCPOutcome == want {
+					t.Logf("collector: TCP outcome=%s", rec.TCPOutcome)
+					return
+				}
+			}
+			t.Fatalf("missing matching TCP outcome %s: %s", want, data)
+		})
+	}
+}
+
+func TestTCPConnectFDReuse(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	dir := t.TempDir()
+	collector, target := filepath.Join(dir, "ichnograph"), filepath.Join(dir, "connect")
+	for _, item := range []struct{ output, pkg string }{{collector, "../../cmd/ichnograph"}, {target, "./testdata/connect"}} {
+		if out, err := exec.Command("go", "build", "-o", item.output, item.pkg).CombinedOutput(); err != nil {
+			t.Fatalf("build: %v: %s", err, out)
+		}
+	}
+	server, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	output := filepath.Join(dir, "result.json")
+	out, err := exec.Command(collector, "-o", output, target, "reuse", strconv.Itoa(server.Addr().(*net.TCPAddr).Port)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("fixture: %v: %s", err, out)
+	}
+	t.Logf("target: %s", strings.TrimSpace(string(out)))
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result Result
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Lost != 0 {
+		t.Fatalf("lost %d events", result.Lost)
+	}
+	type key struct {
+		pid, tid uint32
+		id       uint64
+	}
+	attempts := map[key]bool{}
+	outcomes := map[key]int{}
+	fds := map[int32]bool{}
+	for _, rec := range result.Records {
+		if rec.Event == "connect_attempt" && rec.Network != nil && rec.Network.Port != nil && int(*rec.Network.Port) == server.Addr().(*net.TCPAddr).Port {
+			if rec.ConnectionID == 0 || rec.FD == nil {
+				t.Fatalf("missing identity: %+v", rec)
+			}
+			k := key{rec.PID, rec.TID, rec.ConnectionID}
+			if attempts[k] {
+				t.Fatalf("duplicate connection id: %+v", rec)
+			}
+			attempts[k] = true
+			fds[*rec.FD] = true
+		}
+		if rec.Event == "tcp_connect_outcome" && rec.TCPOutcome == "established" {
+			outcomes[key{rec.PID, rec.TID, rec.ConnectionID}]++
+		}
+	}
+	t.Logf("connections=%d distinct_fds=%d outcomes=%d", len(attempts), len(fds), len(outcomes))
+	if len(attempts) != 20 || len(fds) != 1 {
+		t.Fatalf("expected 20 connections reusing one fd")
+	}
+	for k := range attempts {
+		if outcomes[k] != 1 {
+			t.Errorf("connection %+v has %d established outcomes", k, outcomes[k])
+		}
+	}
+	for k := range outcomes {
+		if !attempts[k] {
+			t.Errorf("unmatched outcome %+v", k)
+		}
+	}
+}
+
+func TestTCPConnectConcurrent(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	dir := t.TempDir()
+	collector, target := filepath.Join(dir, "ichnograph"), filepath.Join(dir, "connect")
+	for _, item := range []struct{ output, pkg string }{{collector, "../../cmd/ichnograph"}, {target, "./testdata/connect"}} {
+		if out, err := exec.Command("go", "build", "-o", item.output, item.pkg).CombinedOutput(); err != nil {
+			t.Fatalf("build: %v: %s", err, out)
+		}
+	}
+	server, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	port := server.Addr().(*net.TCPAddr).Port
+	output := filepath.Join(dir, "result.json")
+	out, err := exec.Command(collector, "-o", output, target, "concurrent", strconv.Itoa(port)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("fixture: %v: %s", err, out)
+	}
+	t.Logf("target: %s", strings.TrimSpace(string(out)))
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result Result
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Lost != 0 {
+		t.Fatalf("lost %d events", result.Lost)
+	}
+	type key struct {
+		pid, tid uint32
+		id       uint64
+	}
+	attempts := map[key]bool{}
+	outcomes := map[key]int{}
+	tids := map[uint32]bool{}
+	for _, rec := range result.Records {
+		if rec.Event == "connect_attempt" && rec.Network != nil && rec.Network.Port != nil && int(*rec.Network.Port) == port {
+			if rec.ConnectionID == 0 {
+				t.Fatalf("missing id: %+v", rec)
+			}
+			k := key{rec.PID, rec.TID, rec.ConnectionID}
+			if attempts[k] {
+				t.Fatalf("duplicate: %+v", rec)
+			}
+			attempts[k] = true
+			tids[rec.TID] = true
+		}
+		if rec.Event == "tcp_connect_outcome" && rec.TCPOutcome == "established" {
+			outcomes[key{rec.PID, rec.TID, rec.ConnectionID}]++
+		}
+	}
+	t.Logf("connections=%d threads=%d outcomes=%d", len(attempts), len(tids), len(outcomes))
+	if len(attempts) != 32 || len(tids) < 2 {
+		t.Fatalf("expected 32 connections across multiple threads")
+	}
+	for k := range attempts {
+		if outcomes[k] != 1 {
+			t.Errorf("connection %+v has %d outcomes", k, outcomes[k])
+		}
+	}
+	for k := range outcomes {
+		if !attempts[k] {
+			t.Errorf("unmatched outcome %+v", k)
+		}
+	}
+}
+
+func TestTCPConnectInheritedAndCancel(t *testing.T) {
+	if os.Getenv("ICHNOGRAPH_BPF_TEST") != "1" {
+		t.Skip("set ICHNOGRAPH_BPF_TEST=1 on a privileged Linux host")
+	}
+	dir := t.TempDir()
+	collector, target := filepath.Join(dir, "ichnograph"), filepath.Join(dir, "connect")
+	for _, item := range []struct{ output, pkg string }{{collector, "../../cmd/ichnograph"}, {target, "./testdata/connect"}} {
+		if out, err := exec.Command("go", "build", "-o", item.output, item.pkg).CombinedOutput(); err != nil {
+			t.Fatalf("build: %v: %s", err, out)
+		}
+	}
+	check := func(t *testing.T, mode string, port int, stdin *os.File, want string) {
+		t.Helper()
+		output := filepath.Join(dir, mode+".json")
+		cmd := exec.Command(collector, "-o", output, target, mode, strconv.Itoa(port))
+		cmd.Stdin = stdin
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("fixture: %v: %s", err, out)
+		}
+		t.Logf("target: %s", strings.TrimSpace(string(out)))
+		data, err := os.ReadFile(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result Result
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.Lost != 0 {
+			t.Fatalf("lost %d events", result.Lost)
+		}
+		for _, connect := range result.Records {
+			if connect.Event != "connect_attempt" || connect.Network == nil || connect.Network.Port == nil || int(*connect.Network.Port) != port {
+				continue
+			}
+			if connect.ConnectionID == 0 {
+				t.Fatalf("missing connection ID: %+v", connect)
+			}
+			if mode == "inherited" && (connect.FD == nil || *connect.FD != 0) {
+				t.Fatalf("expected inherited fd 0: %+v", connect)
+			}
+			for _, state := range result.Records {
+				if state.Event == "tcp_connect_outcome" && state.ConnectionID == connect.ConnectionID && state.PID == connect.PID && state.TID == connect.TID && state.TCPOutcome == want {
+					t.Logf("matched %s", want)
+					return
+				}
+			}
+		}
+		t.Fatalf("missing matching %s outcome: %s", want, data)
+	}
+	t.Run("inherited", func(t *testing.T) {
+		server, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer server.Close()
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		socket := os.NewFile(uintptr(fd), "inherited-socket")
+		defer socket.Close()
+		check(t, "inherited", server.Addr().(*net.TCPAddr).Port, socket, "established")
+	})
+	t.Run("cancel", func(t *testing.T) {
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unix.Close(fd)
+		if err := unix.Bind(fd, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Listen(fd, 0); err != nil {
+			t.Fatal(err)
+		}
+		addr, err := unix.Getsockname(fd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := addr.(*unix.SockaddrInet4).Port
+		filler, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unix.Close(filler)
+		if err := unix.Connect(filler, &unix.SockaddrInet4{Port: port, Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+			t.Fatal(err)
+		}
+		check(t, "cancel", port, nil, "closed_before_established")
+	})
 }

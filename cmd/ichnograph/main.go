@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/longicorn/ichnograph/internal/ebpf"
@@ -18,15 +20,19 @@ func main() {
 		return
 	}
 	output := flag.String("o", "", "output JSON file (required)")
+	includeLogs := flag.Bool("include-logs", false, "include /var/log and .log file records")
 	flag.Parse()
 	if *output == "" || flag.NArg() == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ichnograph -o output.json command [args...]")
+		fmt.Fprintln(os.Stderr, "usage: ichnograph [-include-logs] -o output.json command [args...]")
 		os.Exit(2)
 	}
 	result, code, err := ebpf.Run(flag.Args())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+	if !*includeLogs {
+		filterLogs(&result)
 	}
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err == nil {
@@ -38,6 +44,28 @@ func main() {
 	}
 	os.Exit(code)
 }
+
+// filterLogs filters the output after collection; it does not reduce BPF traffic.
+func filterLogs(result *ebpf.Result) {
+	kept := result.Records[:0]
+	for _, rec := range result.Records {
+		if isLogPath(rec.Path) || isLogPath(rec.ResolvedPath) {
+			continue
+		}
+		kept = append(kept, rec)
+	}
+	result.Records = kept
+	result.Limitations = append(result.Limitations, "Records with paths under /var/log or ending in .log are excluded by default; relative and descriptor paths may be unresolved or inaccurate. Use -include-logs to include them. Filtering occurs after collection and does not reduce event loss.")
+}
+
+func isLogPath(path string) bool {
+	if path == "" {
+		return false
+	}
+	clean := filepath.Clean(path)
+	return clean == "/var/log" || strings.HasPrefix(clean, "/var/log/") || strings.HasSuffix(clean, ".log")
+}
+
 func helper() {
 	if len(os.Args) < 3 {
 		os.Exit(2)
