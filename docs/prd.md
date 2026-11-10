@@ -8,7 +8,11 @@ Ichnograph is a foundation for investigating what a product feature depends on a
 
 Users exercise a feature and use the resulting evidence to investigate its dependencies. Over time, the investigation should connect application code, including JavaScript/TSX and Ruby, with libraries and native extensions, databases, third-party services, OS libraries and commands, and kernel functionality. It should connect runtime observations with SBOM and package information and represent relationships in a dependency graph.
 
-The implementation is in Go. The intended collection approach uses eBPF to capture PID/TID, event type, timestamps, file and socket identifiers, and stack IDs when needed. Go-side processing can enrich this evidence using ELF, DWARF, Go symbols, package information and other context. DWARF is a candidate for analyzing compiled languages such as C and Go. These are directions for subsequent work, not claims of initial coverage.
+## Observation granularity
+
+Capture evidence sufficient to identify files and code used, including interpreted code, and descriptor use relevant to dependencies. Prefer recording meaningful use and relationships over logging every read or write. Capturing descriptor contents or communication payloads is not a goal. For external communication, aim to identify the endpoint, protocol and associated libraries where possible; attribution may require additional evidence.
+
+Collection should work under realistic workloads while limiting event loss. Report known loss, failures and unavailable information so that users can assess the evidence. The appropriate granularity must preserve evidence from inherited descriptors and other access paths; it is not defined by a fixed list of syscalls.
 
 ## First milestone
 
@@ -16,7 +20,7 @@ Demonstrate eBPF collection on Linux by running a target command and producing f
 
 - Record observed file accesses with a path where it can be resolved, PID, TID and timestamp; include event type and a file hash where obtainable.
 - Track the command and its relevant child processes and threads, and output the records as JSON for subsequent processing.
-- Make unavailable information and known event loss or collection failures visible so that incomplete results are not mistaken for complete coverage.
+- Support realistic workloads with appropriately bounded event volume, and make unavailable information and known event loss or collection failures visible so that incomplete results are not mistaken for complete coverage.
 - Validate the result against a known command and its file accesses, including a child process, and compare the available fields with ichno's output.
 
 Exact probe selection, hash timing and algorithms, required privileges, and supported kernel versions remain implementation decisions. A hash describes the content when it is calculated and may not represent the exact bytes accessed if the file changes.
