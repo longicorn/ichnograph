@@ -19,3 +19,13 @@ Use eBPF on Linux to collect runtime evidence as described in the [product requi
 The CLI entry point invokes `internal/ebpf`, formats the structured result as JSON, and applies command-level output options. By default, the CLI excludes records whose path or resolved path is under `/var/log` or ends in `.log` after collection unless `-include-logs` is specified, and records this post-collection filter in the output limitations because it does not reduce kernel event volume or loss.
 
 Detailed architectural decisions for eBPF probe selection, process tracking, event filtering, deduplication, path resolution and loss handling are documented in the [eBPF architecture decisions](ebpf/adr.md).
+
+## Separation of runtime normalization and external metadata mapping
+
+**Status:** Accepted
+
+Keep `internal/ebpf` focused on privileged kernel event collection and raw observation output. Implement post-collection normalization and external metadata integration as separate, unprivileged stages:
+
+1. **In-repository runtime normalization:** Summarize raw collector records in Go into a normalized view of observed files (path, hash and access roles), process trees, network endpoints, IPC activity and collection limitations. Keep this stage independent of language-specific package managers so that `ichnograph` alone can produce a self-contained runtime summary for workflows such as test-skipping checks.
+2. **Schema-driven external metadata merging:** Rather than embedding parsers for every language package manager, SBOM format, OS package database or middleware directly into the core collector, define a common mapping schema and merging rules. External tools or adapters supply component ownership mappings (matching file paths, binary symbols or network endpoints to components and versions) and declared static dependencies (such as from `Gemfile.lock` or SBOMs).
+3. **Explicit attribution states:** When combining the normalized runtime summary with external mappings, preserve whether each component or edge is backed by runtime observation, present only in static declarations, or observed at runtime without a matching component. Carry forward collector loss and limitation metadata so downstream consumers can evaluate confidence.

@@ -37,9 +37,16 @@ Demonstrate eBPF collection on Linux by running a target command and producing f
 
 Detailed collector requirements, covered operations, enrichment, deduplication and loss reporting for the Linux eBPF collector are defined in the [eBPF product requirements](ebpf/prd.md).
 
-## Later capabilities
+## Runtime normalization and external metadata integration
 
-To capture the broader composition of target programs, expand capabilities incrementally to stack and call-graph collection, executable and debug metadata analysis such as DWARF, identification of databases and services behind socket connections, and correlation against language packages, OS packages and SBOMs. Build a graph that supports traversal from a feature or test case to its dependencies and impact investigation in the reverse direction when components change. Container support and runtime-specific analysis will be defined and expanded incrementally.
+After raw collection, organize and combine evidence in two stages rather than hardcoding every language or package ecosystem into the collector:
+
+1. **Normalized runtime summary:** Aggregate raw event streams within `ichnograph` into a clean summary of observed resources—accessed files (with normalized paths, hashes and usage roles such as execution, memory mapping, read or write), process relationships, network endpoints, pipe/FIFO activity and completeness metadata (`lost` and `limitations`). This normalized summary is sufficient on its own for workflows such as selective test skipping.
+2. **External metadata mapping and unified format:** Define a common mapping contract and output format for combining the normalized runtime summary with external ecosystem metadata (such as `Gemfile.lock` and installed package paths, OS package file lists, SBOMs, DWARF/symbol analysis or service endpoint definitions).
+   - Represent external metadata through two common primitives: **resource ownership** (which component or service owns a given file path, binary range or network endpoint) and **declared dependencies** (static relationships between components).
+   - In the combined output, distinguish components and relationships **observed at runtime**, components **declared statically but unobserved during the run**, and **unattributed runtime activity** that did not match any known component.
+
+To capture the broader composition of target programs over time, expand collection and external integration incrementally to stack and call-graph evidence, executable and debug metadata such as DWARF, and service attribution behind socket connections.
 
 ## Interpretation and boundaries
 
