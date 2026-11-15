@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,28 +24,89 @@ func main() {
 }
 
 func run(args []string) int {
-	usage := "usage: ichnograph trace [-include-logs] -o output.json command [args...]"
-	if len(args) > 0 && args[0] == "clew" {
-		return runClew(args[1:])
+	if len(args) == 0 {
+		return usageError("missing subcommand", "")
 	}
-	if len(args) == 0 || args[0] != "trace" {
-		fmt.Fprintln(os.Stderr, usage)
-		return 2
-	}
-	flags := flag.NewFlagSet("trace", flag.ContinueOnError)
-	flags.SetOutput(os.Stderr)
-	flags.Usage = func() { fmt.Fprintln(os.Stderr, usage) }
-	output := flags.String("o", "", "output JSON file (required)")
-	includeLogs := flags.Bool("include-logs", false, "include /var/log and .log file records")
-	if err := flags.Parse(args[1:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
+	switch args[0] {
+	case "-h", "--help":
+		if len(args) != 1 {
+			return usageError("unexpected arguments", "")
+		}
+		printHelp(os.Stdout, "")
+		return 0
+	case "help":
+		if len(args) == 1 {
+			printHelp(os.Stdout, "")
 			return 0
 		}
+		if len(args) == 2 && (args[1] == "-h" || args[1] == "--help") {
+			printHelp(os.Stdout, "help")
+			return 0
+		}
+		if len(args) != 2 {
+			return usageError("unexpected arguments", "help")
+		}
+		if args[1] != "trace" && args[1] != "clew" && args[1] != "help" {
+			return usageError("unknown subcommand: "+args[1], "")
+		}
+		printHelp(os.Stdout, args[1])
+		return 0
+	case "clew":
+		return runClew(args[1:])
+	case "trace":
+		return runTrace(args[1:])
+	default:
+		return usageError("unknown subcommand: "+args[0], "")
+	}
+}
+
+func usageError(message, topic string) int {
+	fmt.Fprintln(os.Stderr, "error:", message)
+	printHelp(os.Stderr, topic)
+	return 2
+}
+
+func printHelp(w io.Writer, topic string) {
+	switch topic {
+	case "trace":
+		f, _, _ := traceFlags(w)
+		f.Usage()
+	case "clew":
+		f, _, _ := clewFlags(w)
+		f.Usage()
+	case "help":
+		fmt.Fprintln(w, "usage: ichnograph help [subcommand]\nDisplay help for a public subcommand.")
+	default:
+		fmt.Fprintln(w, "usage: ichnograph <subcommand> [options] [arguments]\n\nSubcommands:\n  trace  Trace a command and write observations to JSON.\n  clew   Group trace or clew JSON output.\n  help   Display help.\n\nUse ichnograph help <subcommand> for details.")
+	}
+}
+
+func traceFlags(w io.Writer) (*flag.FlagSet, *string, *bool) {
+	f := flag.NewFlagSet("trace", flag.ContinueOnError)
+	f.SetOutput(w)
+	output := f.String("o", "", "output JSON file (required; default: none)")
+	logs := f.Bool("include-logs", false, "include /var/log and .log file records (default: false)")
+	f.Usage = func() {
+		fmt.Fprintln(w, "usage: ichnograph trace [-include-logs] -o output.json command [args...]\nTrace a command and write observations to JSON.\nOptions:")
+		f.PrintDefaults()
+	}
+	return f, output, logs
+}
+
+func runTrace(args []string) int {
+	flags, output, includeLogs := traceFlags(os.Stderr)
+	// flag invokes Usage for help; suppress it and render to the appropriate stream.
+	flags.Usage = func() {}
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printHelp(os.Stdout, "trace")
+			return 0
+		}
+		printHelp(os.Stderr, "trace")
 		return 2
 	}
 	if *output == "" || flags.NArg() == 0 {
-		flags.Usage()
-		return 2
+		return usageError("trace requires -o and a command", "trace")
 	}
 	result, code, err := ebpf.Run(flags.Args())
 	if err != nil {

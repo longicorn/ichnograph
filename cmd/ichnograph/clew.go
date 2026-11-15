@@ -4,26 +4,36 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 )
 
-func runClew(args []string) int {
-	const usage = "usage: ichnograph clew [-group-by pid,tid] [-o output.json] [input.json]"
+func clewFlags(w io.Writer) (*flag.FlagSet, *string, *string) {
 	f := flag.NewFlagSet("clew", flag.ContinueOnError)
-	f.SetOutput(os.Stderr)
-	f.Usage = func() { fmt.Fprintln(os.Stderr, usage) }
-	group := f.String("group-by", "pid,tid", "grouping keys")
-	output := f.String("o", "-", "output JSON file")
+	f.SetOutput(w)
+	group := f.String("group-by", "pid,tid", "grouping keys (only pid,tid is supported)")
+	output := f.String("o", "-", "output JSON file (- for stdout)")
+	f.Usage = func() {
+		fmt.Fprintln(w, "usage: ichnograph clew [-group-by pid,tid] [-o output.json] [input.json]\nGroup trace or clew JSON output; input defaults to stdin.\nOptions:")
+		f.PrintDefaults()
+	}
+	return f, group, output
+}
+
+func runClew(args []string) int {
+	f, group, output := clewFlags(os.Stderr)
+	f.Usage = func() {}
 	if err := f.Parse(args); err != nil {
 		if err == flag.ErrHelp {
+			printHelp(os.Stdout, "clew")
 			return 0
 		}
+		printHelp(os.Stderr, "clew")
 		return 2
 	}
 	if *group != "pid,tid" || f.NArg() > 1 {
-		f.Usage()
-		return 2
+		return usageError("invalid grouping keys or unexpected arguments", "clew")
 	}
 	input := "-"
 	if f.NArg() == 1 {
