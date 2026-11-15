@@ -31,5 +31,5 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
-ichnograph
+/ichnograph
 result.json

@@ -24,6 +24,9 @@ func main() {
 
 func run(args []string) int {
 	usage := "usage: ichnograph trace [-include-logs] -o output.json command [args...]"
+	if len(args) > 0 && args[0] == "clew" {
+		return runClew(args[1:])
+	}
 	if len(args) == 0 || args[0] != "trace" {
 		fmt.Fprintln(os.Stderr, usage)
 		return 2
