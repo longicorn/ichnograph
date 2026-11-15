@@ -19,17 +19,34 @@ func main() {
 		helper()
 		return
 	}
-	output := flag.String("o", "", "output JSON file (required)")
-	includeLogs := flag.Bool("include-logs", false, "include /var/log and .log file records")
-	flag.Parse()
-	if *output == "" || flag.NArg() == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ichnograph [-include-logs] -o output.json command [args...]")
-		os.Exit(2)
+	os.Exit(run(os.Args[1:]))
+}
+
+func run(args []string) int {
+	usage := "usage: ichnograph trace [-include-logs] -o output.json command [args...]"
+	if len(args) == 0 || args[0] != "trace" {
+		fmt.Fprintln(os.Stderr, usage)
+		return 2
 	}
-	result, code, err := ebpf.Run(flag.Args())
+	flags := flag.NewFlagSet("trace", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() { fmt.Fprintln(os.Stderr, usage) }
+	output := flags.String("o", "", "output JSON file (required)")
+	includeLogs := flags.Bool("include-logs", false, "include /var/log and .log file records")
+	if err := flags.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if *output == "" || flags.NArg() == 0 {
+		flags.Usage()
+		return 2
+	}
+	result, code, err := ebpf.Run(flags.Args())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 1
 	}
 	if !*includeLogs {
 		filterLogs(&result)
@@ -40,9 +57,9 @@ func main() {
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 1
 	}
-	os.Exit(code)
+	return code
 }
 
 // filterLogs filters the output after collection; it does not reduce BPF traffic.
@@ -55,7 +72,7 @@ func filterLogs(result *ebpf.Result) {
 		kept = append(kept, rec)
 	}
 	result.Records = kept
-	result.Limitations = append(result.Limitations, "Records with paths under /var/log or ending in .log are excluded by default; relative and descriptor paths may be unresolved or inaccurate. Use -include-logs to include them. Filtering occurs after collection and does not reduce event loss.")
+	result.Limitations = append(result.Limitations, "Records with paths under /var/log or ending in .log are excluded by default; relative and descriptor paths may be unresolved or inaccurate. Use -include-logs to include them. Filtering occurs after collection and does not reduce kernel event volume or loss.")
 }
 
 func isLogPath(path string) bool {

@@ -17,12 +17,12 @@ Linux上でCLIをビルドし、eBPFプログラムのロードとトレース�
 
 ```sh
 go build -o ichnograph ./cmd/ichnograph
-sudo ./ichnograph -o result.json /path/to/command arg
+sudo ./ichnograph trace -o result.json /path/to/command arg
 ```
 
 - 既定では、収集後にパスまたは解決済みパスが`/var/log`配下にあるレコードや`.log`で終わるレコードを除外します。含める場合は`-include-logs`を指定します。
   ```sh
-  sudo ./ichnograph -include-logs -o result.json /path/to/command arg
+  sudo ./ichnograph trace -include-logs -o result.json /path/to/command arg
   ```
 - 結果を書き出したあと、`ichnograph`は対象コマンドの終了コードを返します（シグナル終了時は`128 + シグナル番号`、コマンドが見つからない場合は`127`、実行できない場合は`126`）。
 
@@ -61,7 +61,7 @@ docker run --rm -it \
   --ulimit memlock=-1:-1 \
   -v /sys/kernel/tracing:/sys/kernel/tracing:rw \
   -v /sys/kernel/debug:/sys/kernel/debug:rw \
-  <image> ./ichnograph -o result.json /path/to/command arg
+  <image> ./ichnograph trace -o result.json /path/to/command arg
 ```
 
 `compose.yaml`で必要なケーパビリティを個別に指定する場合は、次のように設定します。

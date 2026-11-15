@@ -35,7 +35,7 @@ Demonstrate eBPF collection on Linux by running a target command and producing f
 - Support realistic workloads with appropriately bounded event volume, and make unavailable information and known event loss or collection failures visible so that incomplete results are not mistaken for complete coverage.
 - Validate the result against a known command and its file accesses, including a child process.
 
-Detailed collector requirements, covered operations, enrichment, deduplication and loss reporting for the Linux eBPF collector are defined in the [eBPF product requirements](ebpf/prd.md).
+CLI invocation, output handling, post-collection log filtering and exit-status requirements for running a target command are defined in the [trace product requirements](trace/prd.md). Detailed collector requirements, covered operations, enrichment, deduplication and loss reporting for the Linux eBPF collector are defined in the [eBPF product requirements](ebpf/prd.md).
 
 ## Runtime normalization and external metadata integration
 

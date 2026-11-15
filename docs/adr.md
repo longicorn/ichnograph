@@ -16,9 +16,9 @@ Place command entry points under `cmd/` and organize implementation into feature
 
 Use eBPF on Linux to collect runtime evidence as described in the [product requirements](prd.md). Keep collection in `internal/ebpf` separate from command entry points under `cmd/ichnograph`, and enrich observations in Go with process state, file identity and other metadata when appropriate. Permit cgo for native integration when needed and document its build implications.
 
-The CLI entry point invokes `internal/ebpf`, formats the structured result as JSON, and applies command-level output options. By default, the CLI excludes records whose path or resolved path is under `/var/log` or ends in `.log` after collection unless `-include-logs` is specified, and records this post-collection filter in the output limitations because it does not reduce kernel event volume or loss.
+The `cmd/ichnograph` CLI is organized around subcommands so that privileged runtime tracing (`ichnograph trace`) is cleanly separated from unprivileged post-processing subcommands for normalization and external metadata integration. `ichnograph trace` invokes `internal/ebpf`, formats the structured result as JSON, and applies command-level output options such as default `/var/log` and `.log` post-collection filtering (overridable with `-include-logs`).
 
-Detailed architectural decisions for eBPF probe selection, process tracking, event filtering, deduplication, path resolution and loss handling are documented in the [eBPF architecture decisions](ebpf/adr.md).
+Architectural decisions for the `trace` subcommand are documented in the [trace architecture decisions](trace/adr.md), and detailed decisions for eBPF probe selection, process tracking, event filtering, deduplication, path resolution and loss handling are documented in the [eBPF architecture decisions](ebpf/adr.md).
 
 ## Separation of runtime normalization and external metadata mapping
 
