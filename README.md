@@ -17,12 +17,12 @@ On Linux, build the CLI and run it with the privileges required to load eBPF pro
 
 ```sh
 go build -o ichnograph ./cmd/ichnograph
-sudo ./ichnograph -o result.json /path/to/command arg
+sudo ./ichnograph trace -o result.json /path/to/command arg
 ```
 
 - By default, records whose path or resolved path is under `/var/log` or ends in `.log` are excluded after collection. Pass `-include-logs` before `-o` to keep them:
   ```sh
-  sudo ./ichnograph -include-logs -o result.json /path/to/command arg
+  sudo ./ichnograph trace -include-logs -o result.json /path/to/command arg
   ```
 - `ichnograph` exits with the target command's exit status (`128 + signal` when terminated by a signal, `127` if the command is not found, or `126` if it cannot be executed).
 
@@ -61,7 +61,7 @@ docker run --rm -it \
   --ulimit memlock=-1:-1 \
   -v /sys/kernel/tracing:/sys/kernel/tracing:rw \
   -v /sys/kernel/debug:/sys/kernel/debug:rw \
-  <image> ./ichnograph -o result.json /path/to/command arg
+  <image> ./ichnograph trace -o result.json /path/to/command arg
 ```
 
 With explicit capabilities in `compose.yaml`:
