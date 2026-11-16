@@ -1,28 +1,61 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"sort"
+
+	"github.com/longicorn/ichnograph/internal/clew"
 )
+
+type clewValues []string
+
+func (v *clewValues) String() string     { return fmt.Sprint([]string(*v)) }
+func (v *clewValues) Set(s string) error { *v = append(*v, s); return nil }
 
 func clewFlags(w io.Writer) (*flag.FlagSet, *string, *string) {
 	f := flag.NewFlagSet("clew", flag.ContinueOnError)
 	f.SetOutput(w)
+	f.Var(new(clewValues), "include", "include records matching `predicate` (repeatable)")
+	f.Var(new(clewValues), "exclude", "exclude records matching `predicate` (repeatable)")
+	f.Var(new(clewValues), "tag", "add a tag for matching records using `tag:predicate` (repeatable)")
+	f.Bool("tag-file-type", false, "tag detected file types")
 	group := f.String("group-by", "pid,tid", "grouping keys (only pid,tid is supported)")
 	output := f.String("o", "-", "output JSON file (- for stdout)")
 	f.Usage = func() {
-		fmt.Fprintln(w, "usage: ichnograph clew [-group-by pid,tid] [-o output.json] [input.json]\nGroup trace or clew JSON output; input defaults to stdin.\nOptions:")
+		fmt.Fprintln(w, "usage: ichnograph clew [-group-by pid,tid] [-include predicate] [-exclude predicate] [-tag rule] [-tag-file-type] [-o output.json] [input.json]\nGroup trace or clew JSON output; input defaults to stdin.\nOptions:")
 		f.PrintDefaults()
+		fmt.Fprintln(w, `
+Predicates:
+  field=value    Exact match for a string, number, or boolean.
+  field~=value   Substring match for a string (not a regular expression).
+  Fields and tags start with an ASCII letter or underscore and contain only
+  ASCII letters, digits, and underscores. Values must not be empty.
+  Missing fields and incompatible types do not match.
+
+  Include predicates are combined with OR; any matching exclude removes the
+  record. Without include predicates, all records are included initially.
+  Tags are appended to the record's tags array without duplicates. File type
+  detection reads local files, preferring resolved_path over path.
+
+Examples:
+  ichnograph clew -include 'success=true' trace.json
+  ichnograph clew -exclude 'path~=/tmp/' trace.json
+  ichnograph clew -tag 'gem:path~=/gem/ruby/' trace.json
+  ichnograph clew -tag-file-type trace.json`)
+
 	}
 	return f, group, output
 }
 
 func runClew(args []string) int {
 	f, group, output := clewFlags(os.Stderr)
+	include := f.Lookup("include").Value.(*clewValues)
+	exclude := f.Lookup("exclude").Value.(*clewValues)
+	tags := f.Lookup("tag").Value.(*clewValues)
+	fileType := f.Lookup("tag-file-type").Value.(flag.Getter)
+
 	f.Usage = func() {}
 	if err := f.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -34,6 +67,31 @@ func runClew(args []string) int {
 	}
 	if *group != "pid,tid" || f.NArg() > 1 {
 		return usageError("invalid grouping keys or unexpected arguments", "clew")
+	}
+	var opts clew.Options
+	for _, s := range *include {
+		p, err := clew.ParsePredicate(s)
+		if err != nil {
+			return usageError(err.Error(), "clew")
+		}
+		opts.Include = append(opts.Include, p)
+	}
+	for _, s := range *exclude {
+		p, err := clew.ParsePredicate(s)
+		if err != nil {
+			return usageError(err.Error(), "clew")
+		}
+		opts.Exclude = append(opts.Exclude, p)
+	}
+	for _, s := range *tags {
+		p, err := clew.ParseRule(s)
+		if err != nil {
+			return usageError(err.Error(), "clew")
+		}
+		opts.Tags = append(opts.Tags, p)
+	}
+	if fileType.Get().(bool) {
+		opts.Detector = clew.FileDetector{}
 	}
 	input := "-"
 	if f.NArg() == 1 {
@@ -47,7 +105,7 @@ func runClew(args []string) int {
 		data, err = os.ReadFile(input)
 	}
 	if err == nil {
-		data, err = groupClew(data)
+		data, err = clew.Process(data, opts)
 	}
 	if err == nil {
 		if *output == "-" {
@@ -61,98 +119,4 @@ func runClew(args []string) int {
 		return 1
 	}
 	return 0
-}
-
-func groupClew(data []byte) ([]byte, error) {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(data, &obj); err != nil || obj == nil {
-		return nil, fmt.Errorf("invalid input JSON object")
-	}
-	var records []json.RawMessage
-	if format, ok := obj["format"]; ok {
-		var name string
-		if json.Unmarshal(format, &name) != nil || name != "ichnograph.clew.v1" {
-			return nil, fmt.Errorf("unsupported format")
-		}
-		var processes []struct {
-			PID     uint64 `json:"pid"`
-			Threads []struct {
-				TID     uint64            `json:"tid"`
-				Records []json.RawMessage `json:"records"`
-			} `json:"threads"`
-		}
-		if string(obj["processes"]) == "null" || json.Unmarshal(obj["processes"], &processes) != nil || processes == nil {
-			return nil, fmt.Errorf("invalid processes")
-		}
-		for _, p := range processes {
-			if p.Threads == nil {
-				return nil, fmt.Errorf("invalid threads")
-			}
-			for _, t := range p.Threads {
-				if t.Records == nil {
-					return nil, fmt.Errorf("invalid records")
-				}
-				for _, r := range t.Records {
-					var ids struct {
-						PID *uint64 `json:"pid"`
-						TID *uint64 `json:"tid"`
-					}
-					if json.Unmarshal(r, &ids) != nil || ids.PID == nil || ids.TID == nil || *ids.PID != p.PID || *ids.TID != t.TID {
-						return nil, fmt.Errorf("record does not match group")
-					}
-				}
-			}
-		}
-		// Preserve group-level extensions and ordering on an already grouped input.
-		result, err := json.MarshalIndent(obj, "", "  ")
-		return append(result, '\n'), err
-	}
-	if json.Unmarshal(obj["records"], &records) != nil || records == nil {
-		return nil, fmt.Errorf("input must contain a records array")
-	}
-	groups := map[uint64]map[uint64][]json.RawMessage{}
-	for _, r := range records {
-		var ids struct {
-			PID *uint64 `json:"pid"`
-			TID *uint64 `json:"tid"`
-		}
-		if json.Unmarshal(r, &ids) != nil || ids.PID == nil || ids.TID == nil {
-			return nil, fmt.Errorf("record must contain numeric pid and tid")
-		}
-		if groups[*ids.PID] == nil {
-			groups[*ids.PID] = map[uint64][]json.RawMessage{}
-		}
-		groups[*ids.PID][*ids.TID] = append(groups[*ids.PID][*ids.TID], r)
-	}
-	type thread struct {
-		TID     uint64            `json:"tid"`
-		Records []json.RawMessage `json:"records"`
-	}
-	type process struct {
-		PID     uint64   `json:"pid"`
-		Threads []thread `json:"threads"`
-	}
-	pids := make([]uint64, 0, len(groups))
-	for p := range groups {
-		pids = append(pids, p)
-	}
-	sort.Slice(pids, func(i, j int) bool { return pids[i] < pids[j] })
-	processes := make([]process, 0, len(pids))
-	for _, p := range pids {
-		tids := make([]uint64, 0, len(groups[p]))
-		for t := range groups[p] {
-			tids = append(tids, t)
-		}
-		sort.Slice(tids, func(i, j int) bool { return tids[i] < tids[j] })
-		v := process{PID: p, Threads: []thread{}}
-		for _, t := range tids {
-			v.Threads = append(v.Threads, thread{t, groups[p][t]})
-		}
-		processes = append(processes, v)
-	}
-	delete(obj, "records")
-	obj["format"] = json.RawMessage(`"ichnograph.clew.v1"`)
-	obj["processes"], _ = json.Marshal(processes)
-	result, err := json.MarshalIndent(obj, "", "  ")
-	return append(result, '\n'), err
 }
