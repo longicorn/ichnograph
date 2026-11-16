@@ -26,6 +26,22 @@ sudo ./ichnograph trace -o result.json /path/to/command arg
   ```
 - 結果を書き出したあと、`ichnograph`は対象コマンドの終了コードを返します（シグナル終了時は`128 + シグナル番号`、コマンドが見つからない場合は`127`、実行できない場合は`126`）。
 
+`clew`は特権なしでトレース結果を処理します。レコードをプロセスとスレッドごとにまとめ、フィルタやタグ付けを行えます。
+
+```sh
+./ichnograph clew -include 'success=true' -tag 'gem:path~=/gem/ruby/' -o grouped.json result.json
+```
+
+入力と出力の既定値はそれぞれ標準入力と標準出力なので、`clew`をパイプでつなげます。条件式には完全一致の`field=value`と部分文字列一致の`field~=value`を使います。詳しくは[clewのプロダクト要求](docs/clew/prd.ja.md)を参照してください。
+
+`help`でサブコマンドやオプションを確認できます。
+
+```sh
+./ichnograph help
+./ichnograph help trace
+./ichnograph help clew
+```
+
 観測対象のイベント、重複排除、パス解決、ハッシュ計算、損失報告の詳細は[eBPFプロダクト要求](docs/ebpf/prd.ja.md)と[eBPFアーキテクチャ決定記録](docs/ebpf/adr.ja.md)を参照してください。
 
 ## 開発とテスト

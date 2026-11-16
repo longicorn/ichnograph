@@ -26,6 +26,22 @@ sudo ./ichnograph trace -o result.json /path/to/command arg
   ```
 - `ichnograph` exits with the target command's exit status (`128 + signal` when terminated by a signal, `127` if the command is not found, or `126` if it cannot be executed).
 
+`clew` processes trace output without elevated privileges. It groups records by process and thread and can filter or tag them:
+
+```sh
+./ichnograph clew -include 'success=true' -tag 'gem:path~=/gem/ruby/' -o grouped.json result.json
+```
+
+Input and output default to standard input and standard output, so `clew` commands can be chained. Use `field=value` for an exact match and `field~=value` for a substring match. See the [clew product requirements](docs/clew/prd.md) for details.
+
+Use `help` for available subcommands and their options:
+
+```sh
+./ichnograph help
+./ichnograph help trace
+./ichnograph help clew
+```
+
 See the [eBPF product requirements](docs/ebpf/prd.md) and [eBPF architecture decisions](docs/ebpf/adr.md) for details on observed events, deduplication, path resolution, hashing and loss reporting.
 
 ## Development and testing
