@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Predicate struct {
@@ -242,6 +244,7 @@ func Process(data []byte, opts Options) ([]byte, error) {
 				kept = append(kept, r)
 			}
 			if len(kept) > 0 {
+				sortRecords(kept)
 				t["records"], _ = json.Marshal(kept)
 				keptThreads = append(keptThreads, t)
 			}
@@ -268,4 +271,31 @@ func Process(data []byte, opts Options) ([]byte, error) {
 	obj["processes"], _ = json.Marshal(out)
 	result, err := json.MarshalIndent(obj, "", "  ")
 	return append(result, '\n'), err
+}
+
+// sortRecords preserves input order for equal or unparseable timestamps.
+func sortRecords(records []json.RawMessage) {
+	type item struct {
+		raw       json.RawMessage
+		timestamp time.Time
+		valid     bool
+	}
+	items := make([]item, len(records))
+	for i, raw := range records {
+		var v struct {
+			Timestamp string `json:"timestamp"`
+		}
+		err := json.Unmarshal(raw, &v)
+		ts, parseErr := time.Parse(time.RFC3339Nano, v.Timestamp)
+		items[i] = item{raw, ts, err == nil && parseErr == nil}
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].valid != items[j].valid {
+			return items[i].valid
+		}
+		return items[i].valid && items[i].timestamp.Before(items[j].timestamp)
+	})
+	for i := range items {
+		records[i] = items[i].raw
+	}
 }
