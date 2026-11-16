@@ -45,7 +45,7 @@ ichnograph clew [-group-by pid,tid] [-include <predicate>...] [-exclude <predica
 When grouping by `pid,tid`:
 
 - Organize records into a two-level array hierarchy: `processes` (grouped by `pid`) -> `threads` (grouped by `tid`) -> `records`.
-- Using arrays rather than keyed maps allows deterministic ordering (e.g., sorted by `pid` ascending, then `tid` ascending, while preserving observed record order within each thread) and straightforward future addition of per-process or per-thread metadata fields.
+- Using arrays rather than keyed maps allows deterministic ordering (e.g., sorted by `pid` ascending, then `tid` ascending, with records sorted by timestamp within each thread) and straightforward future addition of per-process or per-thread metadata fields.
 - Preserve top-level completeness metadata from the input (`lost`, `loss_breakdown`, `descendants_remaining`, and `limitations`).
 
 Example output structure:
@@ -76,3 +76,5 @@ Example output structure:
 - If the input is not valid JSON or lacks the expected structure for the requested operation, fail with a clear error on standard error and exit with status `1` without writing partial output to `-o`.
 - Post-processing by `clew` operates solely on the supplied input data (and, when file-content type tagging is enabled, readable local files at post-processing time); it does not recover events lost during tracing (`lost` / `loss_breakdown`) and must continue to surface `limitations` and loss metadata so incomplete observations are not mistaken for complete coverage.
 - File-content-based type detection reflects the state of local files when `clew` runs, not necessarily their state at trace collection time; missing, deleted, or unreadable files are silently skipped rather than treated as fatal errors.
+
+Records in each thread are stably sorted by RFC 3339 timestamp in ascending order. Equal timestamps retain input order; records with missing or invalid timestamps follow valid timestamps, retaining their input order. This applies to raw and previously grouped inputs.
