@@ -114,3 +114,31 @@ func TestGroupedInputRequiresGroupIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestTimestampSorting(t *testing.T) {
+	records := `[{"pid":1,"tid":2,"id":"missing"},{"pid":1,"tid":2,"id":"late","timestamp":"2024-01-01T02:00:00+01:00"},{"pid":1,"tid":2,"id":"early","timestamp":"2024-01-01T00:00:00Z"},{"pid":1,"tid":2,"id":"same","timestamp":"2024-01-01T01:00:00Z"},{"pid":1,"tid":2,"id":"invalid","timestamp":"bad"}]`
+	for _, input := range []string{`{"records":` + records + `}`, `{"format":"ichnograph.clew.v1","processes":[{"pid":1,"threads":[{"tid":2,"records":` + records + `}]}]}`} {
+		got, err := Process([]byte(input), Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result struct {
+			Processes []struct {
+				Threads []struct {
+					Records []struct {
+						ID string `json:"id"`
+					} `json:"records"`
+				} `json:"threads"`
+			} `json:"processes"`
+		}
+		if err := json.Unmarshal(got, &result); err != nil {
+			t.Fatal(err)
+		}
+		expected := []string{"early", "late", "same", "missing", "invalid"}
+		for i, r := range result.Processes[0].Threads[0].Records {
+			if r.ID != expected[i] {
+				t.Fatalf("order: %s", got)
+			}
+		}
+	}
+}

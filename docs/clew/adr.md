@@ -21,9 +21,9 @@ Place post-processing under the unprivileged `ichnograph clew` subcommand in `cm
 
 **Status:** Accepted
 
-When grouping by `pid,tid`, `clew` emits a two-level array hierarchy (`processes` sorted by `pid` ascending -> `threads` sorted by `tid` ascending -> `records` in observed order) rather than maps keyed by ID. Using arrays guarantees deterministic output ordering and provides a direct place to attach per-process or per-thread metadata in future stages.
+When grouping by `pid,tid`, `clew` emits a two-level array hierarchy (`processes` sorted by `pid` ascending -> `threads` sorted by `tid` ascending -> `records` sorted by timestamp) rather than maps keyed by ID. Using arrays guarantees deterministic output ordering and provides a direct place to attach per-process or per-thread metadata in future stages.
 
-To support composable pipeline stages without dropping unknown or future fields, `clew` decodes the top-level JSON object and individual records as `json.RawMessage`. This preserves top-level completeness metadata (`lost`, `loss_breakdown`, `descendants_remaining`, `limitations`) and any record-level extensions when grouping raw `trace` input, and preserves group-level extensions and ordering when re-processing an already grouped `"ichnograph.clew.v1"` input.
+To support composable pipeline stages without dropping unknown or future fields, `clew` decodes the top-level JSON object and individual records as `json.RawMessage`. This preserves top-level completeness metadata (`lost`, `loss_breakdown`, `descendants_remaining`, `limitations`) and any record-level extensions when grouping raw `trace` input, and preserves group-level extensions and group ordering when re-processing an already grouped `"ichnograph.clew.v1"` input.
 
 ## Stream-friendly I/O and fail-closed output
 
@@ -71,3 +71,5 @@ File-content-based type detection under `-tag-file-type` is implemented in pure 
 
 - **Path resolution and bounded reads**: For each record, `clew` inspects `resolved_path` if present and non-empty, falling back to `path`. Only regular files are inspected, reading a bounded prefix (header bytes) to detect magic bytes (such as `\x7fELF` for `elf`) and shebang lines (`#!` interpreter names such as `ruby`, `python`, `sh`, `bash`), combined with built-in path/extension presets.
 - **Per-invocation caching and graceful skip**: Results are cached in memory by resolved file path for the duration of a single `clew` invocation to avoid redundant filesystem I/O across repeated references. If a path is missing, not a regular file, or unreadable at post-processing time, content-based tagging is silently skipped for that record without failing the pipeline.
+
+Records in each thread are stably sorted by RFC 3339 timestamp in ascending order. Equal timestamps retain input order; records with missing or invalid timestamps follow valid timestamps, retaining their input order. This applies to raw and previously grouped inputs.
